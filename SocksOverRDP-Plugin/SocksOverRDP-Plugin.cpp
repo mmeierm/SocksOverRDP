@@ -1,51 +1,44 @@
 /*
-* MIT License
-*
-* Copyright(c) 2020 Balazs Bucsay
-*
-* Permission is hereby granted, free of charge, to any person obtaining a copy
-* of this software and associated documentation files(the "Software"), to deal
-* in the Software without restriction, including without limitation the rights
-* to use, copy, modify, merge, publish, distribute, sublicense, and / or sell
-* copies of the Software, and to permit persons to whom the Software is
-* furnished to do so, subject to the following conditions :
-*
-* The above copyright notice and this permission notice shall be included in all
-* copies or substantial portions of the Software.
-*
-* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.IN NO EVENT SHALL THE
-* AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-* OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-* SOFTWARE.
-*/
-
+ * MIT License
+ *
+ * Copyright(c) 2018 Balazs Bucsay
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files(the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and / or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions :
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
 
 #include "stdafx.h"
-#include "resource.h"
 #include "SocksOverRDP-Plugin.h"
+#include <winsock2.h>
+#include <Ws2tcpip.h>
+#include <stdio.h>
+#include <process.h>
+#include <math.h>
+
+#define _WINSOCK_DEPRECATED_NO_WARNINGS
 
 #pragma comment(lib, "Ws2_32.lib")
 
-#define SocksOverRDP_CHANNEL_NAME "SocksChannel"
 #define BUF_SIZE 4096
+#define DEBUG_PRINT_BUFFER_SIZE 1024
 
-struct arguments {
-	DWORD enabled;
-	WCHAR *ip;
-	WCHAR *port;
-};
-
-// main thread struct for global variables
-struct threadargs {
-	struct arguments	*running_args;
-	SOCKET				sockserver;
-	BOOL				run;
-	IWTSVirtualChannel	*m_ptrChannel = NULL;
-	HANDLE				hThread = NULL;
-} ta;
+DWORD dwOverflow = 0;
+static HANDLE ghMutex, ghLLMutex;
 
 struct threads
 {
@@ -53,133 +46,34 @@ struct threads
 	HANDLE	hThread;
 	BOOL	run;
 	SOCKET	s;
-	struct threads *next;
+	IWTSVirtualChannel* pChannel;
+	BOOL	handshakeDone;
+	BOOL	connected;
+	struct threads* next;
 };
 
-// debug verbose flag
-static BOOL bVerbose = FALSE;
+struct threads* ThreadHead = NULL;
+static IWTSVirtualChannel* g_pChannel = NULL;
+static BOOL bVerbose = FALSE, bDebug = TRUE;
 
-static struct threads *ThreadHead = NULL;
-char szOverflow[BUF_SIZE * 4];
-DWORD dwOverflow = 0;
-
-static HANDLE ghMutex, ghLLMutex;
-
-using namespace ATL;
-
-#define CHECK_QUIT_HR( _x_ )    if(FAILED(hr)) { return hr; }
-
-class ATL_NO_VTABLE SocksOverRDPPlugin :
-	public CComObjectRootEx<CComMultiThreadModel>,
-	public CComCoClass<SocksOverRDPPlugin, &CLSID_CompReg>,
-	public IWTSPlugin,
-	public IWTSVirtualChannelCallback,
-	public IWTSListenerCallback
+// Thread management functions
+struct threads* AddThread(DWORD dwThreadId, SOCKET s, IWTSVirtualChannel* pChannel)
 {
-public:
-	CComPtr<IWTSVirtualChannel> m_ptrChannel;
-
-	DECLARE_REGISTRY_RESOURCEID(IDR_SocksOverRDPPLUGIN)
-
-	BEGIN_COM_MAP(SocksOverRDPPlugin)
-		COM_INTERFACE_ENTRY(IWTSPlugin)
-		COM_INTERFACE_ENTRY(IWTSVirtualChannelCallback)
-		COM_INTERFACE_ENTRY(IWTSListenerCallback)
-	END_COM_MAP()
-
-	DECLARE_PROTECT_FINAL_CONSTRUCT()
-
-
-	HRESULT FinalConstruct()
-	{
-		return S_OK;
-	}
-
-	void FinalRelease()
-	{
-	}
-
-	// IWTSPlugin.
-	//
-	HRESULT STDMETHODCALLTYPE
-		Initialize(IWTSVirtualChannelManager *pChannelMgr);
-
-	HRESULT STDMETHODCALLTYPE Connected();
-
-	HRESULT STDMETHODCALLTYPE Disconnected(DWORD dwDisconnectCode)
-	{
-		// Prevent C4100 "unreferenced parameter" warnings.
-		dwDisconnectCode;
-		return S_OK;
-	}
-
-	HRESULT STDMETHODCALLTYPE Terminated()
-	{
-		return S_OK;
-	}
-
-	VOID SetChannel(IWTSVirtualChannel *pChannel, struct threadargs *pTa);
-
-	// IWTSVirtualChannelCallbackdwDummyThreadId
-	//
-	HRESULT STDMETHODCALLTYPE OnDataReceived(ULONG cbSize, __in_bcount(cbSize) BYTE *pBuffer);
-	
-	HRESULT STDMETHODCALLTYPE OnClose()
-	{
-		ta.run = FALSE;
-		//DebugPrint(0, L"[*] Terminating thread, closing socket and channel0");
-		TerminateThreads();
-
-		closesocket(gpta->sockserver);
-		
-		ta.m_ptrChannel = NULL;
-		WSACleanup();
-		return S_OK;
-	}
-
-	HRESULT STDMETHODCALLTYPE
-		OnNewChannelConnection(
-			__in IWTSVirtualChannel *pChannel,
-			__in_opt BSTR data,
-			__out BOOL *pbAccept,
-			__out IWTSVirtualChannelCallback **ppCallback);
-
-	// non-inherited ones
-
-	struct threadargs *gpta;
-	struct arguments running_args;
-
-	static struct threads *SocksOverRDPPlugin::AddThread(DWORD dwThreadId, SOCKET s);
-	static VOID SocksOverRDPPlugin::DeleteThread(DWORD dwThreadId);
-	static VOID SocksOverRDPPlugin::TerminateThreads();
-	static struct threads *SocksOverRDPPlugin::LookupThread(DWORD dwThreadId);
-	static VOID SocksOverRDPPlugin::StopThread(DWORD dwThreadId);
-
-	static VOID SocksOverRDPPlugin::DebugPrint(HRESULT hrDbg, __in_z LPWSTR fmt, ...);
-	LONG SocksOverRDPPlugin::GetDWORDRegKey(HKEY hKey, WCHAR *strValueName, DWORD *nValue);
-	LONG SocksOverRDPPlugin::GetStringRegKey(HKEY hKey, WCHAR *strValueName, WCHAR **strValue);
-	BOOL SocksOverRDPPlugin::GetRegistrySettings();
-	static DWORD WINAPI SocksOverRDPPlugin::RelayToRDPChannel(PVOID param);
-	static DWORD WINAPI SocksOverRDPPlugin::ListenerThread(PVOID param);
-};
-
-OBJECT_ENTRY_AUTO(__uuidof(CompReg), SocksOverRDPPlugin)
-
-// Add thread to linked list
-struct threads *SocksOverRDPPlugin::AddThread(DWORD dwThreadId, SOCKET s)
-{
-	struct threads *rolling;
-	struct threads *ThreadStruct;
+	struct threads* rolling;
+	struct threads* ThreadStruct;
 
 	DWORD dwWaitResult = WaitForSingleObject(ghLLMutex, INFINITE);
 	switch (dwWaitResult)
 	{
 	case WAIT_OBJECT_0:
-		ThreadStruct = (struct threads *)malloc(sizeof(struct threads));
+		ThreadStruct = (threads*)malloc(sizeof(struct threads));
 		ThreadStruct->dwThreadId = dwThreadId;
-		ThreadStruct->hThread = GetCurrentThread();
+		ThreadStruct->hThread = NULL;
 		ThreadStruct->run = TRUE;
 		ThreadStruct->s = s;
+		ThreadStruct->pChannel = pChannel;
+		ThreadStruct->handshakeDone = FALSE;
+		ThreadStruct->connected = FALSE;
 		ThreadStruct->next = NULL;
 
 		if (ThreadHead == NULL)
@@ -198,25 +92,68 @@ struct threads *SocksOverRDPPlugin::AddThread(DWORD dwThreadId, SOCKET s)
 
 		if (!ReleaseMutex(ghLLMutex))
 		{
-			if (bVerbose) DebugPrint(0, L"[*] AddThread Release failed: %08X", dwThreadId);
+			printf("AddThread Release failed\n");
 		}
-
 		return ThreadStruct;
 		break;
 
 	case WAIT_ABANDONED:
-		if (bVerbose) DebugPrint(0, L"[*] AddThread abandoned: %08X", GetCurrentThreadId());
+		printf("AddThread lock abandoned\n");
 		return NULL;
 	}
 
 	return NULL;
 }
 
-// Remove thread from linked list
-VOID SocksOverRDPPlugin::DeleteThread(DWORD dwThreadId)
+struct threads* LookupThread(DWORD dwThreadId)
 {
-	struct threads *rolling;
-	struct threads *prev = NULL;
+	struct threads* rolling;
+
+	DWORD dwWaitResult = WaitForSingleObject(ghLLMutex, INFINITE);
+	switch (dwWaitResult)
+	{
+	case WAIT_OBJECT_0:
+		rolling = ThreadHead;
+		if (rolling == NULL)
+		{
+			if (!ReleaseMutex(ghLLMutex))
+			{
+				printf("LookupThread Release Failed0\n");
+			}
+			return NULL;
+		}
+
+		while (rolling)
+		{
+			if (rolling->dwThreadId == dwThreadId)
+			{
+				if (!ReleaseMutex(ghLLMutex))
+				{
+					printf("LookupThread Release Failed1\n");
+				}
+				return rolling;
+			}
+			rolling = rolling->next;
+		}
+
+		if (!ReleaseMutex(ghLLMutex))
+		{
+			printf("LookupThread Release Failed2\n");
+		}
+		return NULL;
+		break;
+	case WAIT_ABANDONED:
+		printf("LookupThread lock abandoned\n");
+		return NULL;
+	}
+
+	return NULL;
+}
+
+VOID DeleteThread(DWORD dwThreadId)
+{
+	struct threads* rolling;
+	struct threads* prev = NULL;
 
 	DWORD dwWaitResult = WaitForSingleObject(ghLLMutex, INFINITE);
 	switch (dwWaitResult)
@@ -226,659 +163,615 @@ VOID SocksOverRDPPlugin::DeleteThread(DWORD dwThreadId)
 		{
 			if (!ReleaseMutex(ghLLMutex))
 			{
-				if (bVerbose) DebugPrint(0, L"[*] DeleteThread Release failed: %08X", GetCurrentThreadId());
+				printf("DeleteThread: trying to delete empty list\n");
 			}
 			return;
 		}
 
 		rolling = ThreadHead;
 
-		while (rolling->dwThreadId != dwThreadId)
+		while (rolling && rolling->dwThreadId != dwThreadId)
 		{
 			prev = rolling;
 			rolling = rolling->next;
 		}
 
-		if (prev)
+		if (rolling)
 		{
-			if (rolling->next)
+			if (prev)
 			{
 				prev->next = rolling->next;
 			}
 			else
 			{
-				prev->next = NULL;
+				ThreadHead = rolling->next;
 			}
-		}
-		else
-		{
-			if (ThreadHead->next)
-			{
-				ThreadHead = ThreadHead->next;
-			}
-			else
-			{
-				ThreadHead = NULL;
-			}
-		}
 
-		rolling->run = FALSE;
-		closesocket(rolling->s);
-		rolling->dwThreadId = 0xffffffff;
-		rolling->next = FALSE;
-		rolling->hThread = NULL;
-		rolling->s = NULL;
-		free(rolling);
-		rolling = NULL;
+			rolling->run = FALSE;
+			if (rolling->s != INVALID_SOCKET)
+			{
+				closesocket(rolling->s);
+			}
+			free(rolling);
+		}
 
 		if (!ReleaseMutex(ghLLMutex))
 		{
-			if (bVerbose) DebugPrint(0, L"[*] DeleteThread Release failed: %08X", GetCurrentThreadId());
+			printf("DeleteThread Release failed\n");
 		}
 		return;
 		break;
 
 	case WAIT_ABANDONED:
-		if (bVerbose) DebugPrint(0, L"[*] DeleteThread abandoned: %08X", GetCurrentThreadId());
+		printf("DeleteThread lock abandoned\n");
 		return;
 	}
 }
 
-/*
-Terminate all running threads that handle communication
-by setting the loop condition to FALSE and closing socket.
-*/
-
-VOID SocksOverRDPPlugin::TerminateThreads()
+VOID TerminateThreads()
 {
-	struct threads *rolling;
+	struct threads* rolling;
 
 	DWORD dwWaitResult = WaitForSingleObject(ghLLMutex, INFINITE);
 	switch (dwWaitResult)
 	{
 	case WAIT_OBJECT_0:
 		rolling = ThreadHead;
-
-		if (rolling == NULL)
-		{
-			if (bVerbose) DebugPrint(0, L"[*] Nothing to terminate. Threadhead empty. %08X", GetCurrentThreadId());
-		}
-
 		while (rolling)
 		{
 			rolling->run = FALSE;
-			closesocket(rolling->s);
-
-			rolling = rolling->next;
-		}
-	
-		if (!ReleaseMutex(ghLLMutex))
-		{
-			if (bVerbose) DebugPrint(0, L"[*] TerminateThreads Release failed: %08X", GetCurrentThreadId());
-		}
-		return;
-		break;
-
-	case WAIT_ABANDONED:
-		if (bVerbose) DebugPrint(0, L"[*] TerminateThreads abandoned: %08X", GetCurrentThreadId());
-		return;
-	}
-}
-
-// Stopping a specific thread gently by setting the loop condition to FALSE
-VOID SocksOverRDPPlugin::StopThread(DWORD dwThreadId)
-{
-	struct threads *rolling;
-
-	DWORD dwWaitResult = WaitForSingleObject(ghLLMutex, INFINITE);
-	switch (dwWaitResult)
-	{
-	case WAIT_OBJECT_0:
-		rolling = ThreadHead;
-
-		while (rolling)
-		{
-			if (rolling->dwThreadId == dwThreadId)
+			if (rolling->s != INVALID_SOCKET)
 			{
-				rolling->run = FALSE;
-				if (!ReleaseMutex(ghLLMutex))
-				{
-					if (bVerbose) DebugPrint(0, L"[*] StopThread Release failed0: %08X", GetCurrentThreadId());
-				}
-				return;
+				closesocket(rolling->s);
 			}
 			rolling = rolling->next;
 		}
 
 		if (!ReleaseMutex(ghLLMutex))
 		{
-			if (bVerbose) DebugPrint(0, L"[*] StopThread Release failed1: %08X", GetCurrentThreadId());
+			printf("TerminateThreads Release failed\n");
 		}
-		return;
 		break;
 
 	case WAIT_ABANDONED:
-		if (bVerbose) DebugPrint(0, L"[*] lookupThread abandoned: %08X", GetCurrentThreadId());
-		return;
-	}
-
-	return;
-}
-
-// Look up thread and return a pointer to it by ThreadId
-struct threads *SocksOverRDPPlugin::LookupThread(DWORD dwThreadId)
-{
-	struct threads *rolling;
-
-	DWORD dwWaitResult = WaitForSingleObject(ghLLMutex, INFINITE);
-	switch (dwWaitResult)
-	{
-	case WAIT_OBJECT_0:
-		rolling = ThreadHead;
-
-		while (rolling)
-		{
-			if (rolling->dwThreadId == dwThreadId)
-			{
-				if (!ReleaseMutex(ghLLMutex))
-				{
-					if (bVerbose) DebugPrint(0, L"[*] lookupThread Release failed0: %08X", GetCurrentThreadId());
-				}
-				return rolling;
-			}
-			rolling = rolling->next;
-		}
-
-		if (!ReleaseMutex(ghLLMutex))
-		{
-			if (bVerbose) DebugPrint(0, L"[*] lookupThread Release failed1: %08X", GetCurrentThreadId());
-		}
-		return NULL;
+		printf("TerminateThreads lock abandoned\n");
 		break;
-
-	case WAIT_ABANDONED:
-		if (bVerbose) DebugPrint(0, L"[*] lookupThread abandoned: %08X", GetCurrentThreadId());
-		return NULL;
 	}
-
-	return NULL;
 }
 
-// Debug/Verbose Print function, message shows up in the debugger.
-VOID SocksOverRDPPlugin::DebugPrint(HRESULT hrDbg, __in_z LPWSTR fmt, ...)
+// Write data to RDP channel - FIXED buffer management
+BOOL WriteChannel(IWTSVirtualChannel* pChannel, const char* Buffer, DWORD nBytesToWrite, DWORD dwRemoteThreadId, BOOL bClose)
 {
-	HRESULT	hr;
-	TCHAR	Buffer[DEBUG_PRINT_BUFFER_SIZE];
-	size_t	Len;
+	DWORD dwHeaderSize = sizeof(DWORD) + sizeof(DWORD) + sizeof(BYTE);
+	DWORD dwTotalSize = dwHeaderSize + nBytesToWrite;
+	char* packetBuffer = (char*)malloc(dwTotalSize);
 
-	hr = StringCchPrintf(Buffer, DEBUG_PRINT_BUFFER_SIZE, TEXT("[hr=0x%8x]"), hrDbg);
-	assert(SUCCEEDED(hr)); // buffer is sure to be big enough
-
-	hr = StringCchLength(Buffer, DEBUG_PRINT_BUFFER_SIZE, &Len);
-	assert(SUCCEEDED(hr)); // StringCchPrintf is supposed to always NULL term
-
-	va_list argptr;
-	va_start(argptr, fmt);
-
-	hr = StringCchVPrintf(Buffer + Len, DEBUG_PRINT_BUFFER_SIZE - Len,
-		fmt, argptr);
-
-	// the above could fail but we don't care since we
-	// should get a NULL terminated partial string
-
-	// insert terminating eol (despite failure)
-	hr = StringCchLength(Buffer, DEBUG_PRINT_BUFFER_SIZE, &Len);
-	assert(SUCCEEDED(hr)); // again there should be a NULL term
-
-	if (Len < DEBUG_PRINT_BUFFER_SIZE - 1)
+	if (!packetBuffer)
 	{
-		Len++;
-		Buffer[Len] = TEXT('\0');
-	}
-
-	Buffer[Len - 1] = TEXT('\n');
-
-	OutputDebugString(Buffer);
-}
-
-LONG SocksOverRDPPlugin::GetDWORDRegKey(HKEY hKey, WCHAR *strValueName, DWORD *nValue)
-{
-	DWORD	dwBufferSize(sizeof(DWORD));
-	DWORD	nResult;
-	LONG	nError;
-
-	if ((nError = RegQueryValueEx(hKey, strValueName, 0, NULL, (LPBYTE)&nResult, &dwBufferSize)) == ERROR_SUCCESS)
-	{
-		*nValue = nResult;
-	}
-	return nError;
-}
-
-LONG SocksOverRDPPlugin::GetStringRegKey(HKEY hKey, WCHAR *strValueName, WCHAR **strValue)
-{
-	LPVOID	szTemp = NULL;
-	DWORD	buflen = 255;
-	LONG	nError;
-
-	if ((szTemp = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (size_t)buflen)) == NULL)
-	{
-		if (bVerbose) DebugPrint(GetLastError(), L"[-] Error allocating heap for read buffer %ld", GetLastError());
-		return -1;
-	}
-
-	if ((nError = RegQueryValueExW(hKey, strValueName, 0, NULL, (LPBYTE)szTemp, &buflen)) != ERROR_SUCCESS)
-	{
-		HeapFree(GetProcessHeap(), HEAP_NO_SERIALIZE, szTemp);
-		szTemp = NULL;
-	}
-	*strValue = (WCHAR *)szTemp;
-
-	return nError;
-}
-
-BOOL SocksOverRDPPlugin::GetRegistrySettings()
-{
-	HKEY	hKey;
-	LONG	lRes;
-	WCHAR	*szTemp;
-
-	if ((lRes = RegOpenKeyEx(HKEY_CURRENT_USER, L"SOFTWARE\\Microsoft\\Terminal Server Client\\Default\\AddIns\\SocksOverRDP-Plugin\\", 0, KEY_READ, &hKey)) != ERROR_SUCCESS)
-	{
-		DebugPrint(lRes, L"[-] Error opening registry hive/key");
+		if (bDebug) printf("[-] Failed to allocate packet buffer\n");
 		return FALSE;
 	}
 
-	GetDWORDRegKey(hKey, L"enabled", &running_args.enabled);
-	GetStringRegKey(hKey, L"ip", &szTemp);
-	if (szTemp != NULL)
+	// Prepare header
+	memcpy_s(packetBuffer, sizeof(DWORD), &dwRemoteThreadId, sizeof(DWORD));
+	memcpy_s(packetBuffer + sizeof(DWORD), sizeof(DWORD), &nBytesToWrite, sizeof(DWORD));
+	packetBuffer[sizeof(DWORD) + sizeof(DWORD)] = bClose ? (char)0x01 : (char)0x00;
+
+	// Copy data
+	if (nBytesToWrite > 0)
 	{
-		if (wcslen(szTemp) < 16)
-		{
-			running_args.ip = szTemp;
-		}
-		else
-		{
-			MessageBox(NULL, L"IP too long. Please fix it under the following key:\r\nHKCU\\SOFTWARE\\Microsoft\\Terminal Server Client\\Default\\AddIns\\SocksOverRDP-Plugin\\", L"Registry value error", MB_OK);
-		}
+		memcpy_s(packetBuffer + dwHeaderSize, nBytesToWrite, Buffer, nBytesToWrite);
 	}
-	GetStringRegKey(hKey, L"port", &szTemp);
-	if (szTemp != NULL)
+
+	HRESULT hr = pChannel->Write(dwTotalSize, (BYTE*)packetBuffer, NULL);
+
+	BOOL result = SUCCEEDED(hr);
+	if (bDebug && result)
 	{
-		if (wcslen(szTemp) < 6)
-		{
-			running_args.port = szTemp;
-		}
-		else
-		{
-			MessageBox(NULL, L"Port too long. Please fix it under the following key:\r\nHKCU\\SOFTWARE\\Microsoft\\Terminal Server Client\\Default\\AddIns\\SocksOverRDP-Plugin\\", L"Registry value error", MB_OK);
-		}
+		printf("[+] Sent %ld bytes (header+data) for thread %08X\n", dwTotalSize, dwRemoteThreadId);
 	}
-	
-	return TRUE;
+	else if (bDebug)
+	{
+		printf("[-] Failed to send data for thread %08X, error: 0x%08X\n", dwRemoteThreadId, hr);
+	}
+
+	free(packetBuffer);
+	return result;
 }
 
-
-// IWTSPlugin::Initialize implementation.
-HRESULT SocksOverRDPPlugin::Initialize(__in IWTSVirtualChannelManager *pChannelMgr)
+// SOCKS connection handler
+DWORD WINAPI HandleConnection(void* param)
 {
-	HRESULT	hr;
-	CComObject<SocksOverRDPPlugin> *pListenerCallback;
-	CComPtr<SocksOverRDPPlugin> ptrListenerCallback;
-	CComPtr<IWTSListener> ptrListener;
-	WCHAR	enabledmsg[256];
+	struct threads* pta = (struct threads*)param;
+	SOCKET sock = pta->s;
+	IWTSVirtualChannel* pChannel = pta->pChannel;
+	DWORD dwThreadId = pta->dwThreadId;
 
-	running_args.enabled = 0;
-	running_args.port = L"1080";
-	running_args.ip = L"127.0.0.1";
-
-	if (!GetRegistrySettings())
+	char* dataBuffer = (char*)malloc(BUF_SIZE);
+	if (!dataBuffer)
 	{
-		DebugPrint(-1, L"[-] Could not access the registry settings");
-	}
-
-	if (!running_args.enabled)
-	{
-		DebugPrint(0, L"[*] Plugin disabled");
+		if (bDebug) printf("[-] Failed to allocate data buffer for thread %08X\n", dwThreadId);
 		return -1;
 	}
 
-	wnsprintf(enabledmsg, 255, L"The SocksOverRDP plugin is enabled. When the server binary gets executed, it will listen on: %s:%s", running_args.ip, running_args.port);
-	MessageBox(NULL, enabledmsg, L"SocksOverRDP plugin is enabled", MB_OK | MB_ICONWARNING);
+	int ret;
 
+	if (bDebug) printf("[*] Connection handler started for thread %08X\n", dwThreadId);
 
-	// Create an instance of the CSampleListenerCallback object.
-	hr = CComObject<SocksOverRDPPlugin>::CreateInstance(&pListenerCallback);
-	CHECK_QUIT_HR("SocksOverRDPPlugin::CreateInstance");
-	ptrListenerCallback = pListenerCallback;
-
-	// Attach the callback to the endpoint.
-	hr = pChannelMgr->CreateListener(
-		SocksOverRDP_CHANNEL_NAME,
-		0,
-		(SocksOverRDPPlugin*)ptrListenerCallback,
-		&ptrListener);
-	CHECK_QUIT_HR("CreateListener");
-
-	return hr;
-}
-
-// MSTSC connected to server over RDP
-HRESULT STDMETHODCALLTYPE SocksOverRDPPlugin::Connected()
-{
-	return S_OK;
-}
-
-/*
-This thread is started for each and every connection that is made to the socks 
-proxy. This part only handles the Client->RDP communication.
-Whatever comes from the client will be piped into the RDP channel with prefixed
-with: DWORD(threadid)+DWORD(sizeof(following_data))+BYTE(closurebit)
-*/
-DWORD SocksOverRDPPlugin::RelayToRDPChannel(PVOID param)
-{
-	SOCKET	c = (SOCKET)param;
-	DWORD	dwWaitResult, dwThreadId = GetCurrentThreadId();
-	char	buf[BUF_SIZE + sizeof(DWORD) + sizeof(DWORD) + sizeof(BYTE)];
-	int		ret;
-	struct threads *pta;
-
-	pta = AddThread(dwThreadId, c);	
-	if (!pta)
-	{
-		if (bVerbose) DebugPrint(0, L"%08X: Adding thread failure.", dwThreadId);
-		return -1;
-	}
-
-	// running till error or thread stopped
 	while (pta->run)
 	{
-		// reading from client socket
-		if ((ret = recv(c, buf + sizeof(DWORD) + sizeof(DWORD) + sizeof(BYTE), BUF_SIZE, 0)) > 0)
+		ret = recv(sock, dataBuffer, BUF_SIZE, 0);
+		if (ret <= 0)
 		{
-			// might have been blocked for a long time and the thread should be
-			// stopped already
-			if (!pta->run) break;
-			// prefixing with the necessities
-			memcpy(buf, &dwThreadId, sizeof(DWORD));
-			memcpy(buf + sizeof(DWORD), &ret, sizeof(DWORD));
-			buf[sizeof(DWORD) + sizeof(DWORD)] = 0;
-		}
-		else
-		{
-			// SOCKET_ERROR or RST was received
-			if (!pta->run) 
-				break;
-			if (ret && bVerbose)
-				DebugPrint(0, L"%08X: SOCKS thread(%d) Rsend() failed with errorelayToRDPChannel recv error: %ld %ld", dwThreadId, dwThreadId, ret, WSAGetLastError());
-			ret = 0;
-			memcpy(buf, &dwThreadId, sizeof(DWORD));
-			memcpy(buf + sizeof(DWORD), &ret, sizeof(DWORD));
-			buf[sizeof(DWORD) + sizeof(DWORD)] = 1;
-
-			pta->run = FALSE;
-		}
-
-		// wait on mutex, when it is acquired, block other threads to write
-		dwWaitResult = WaitForSingleObject(ghMutex, INFINITE);
-		switch (dwWaitResult)
-		{
-		case WAIT_OBJECT_0:
-			// write prefixed received data on channel
-			if (ta.m_ptrChannel != NULL)
-				if (ta.m_ptrChannel->Write(ret + sizeof(DWORD) + sizeof(DWORD) + sizeof(BYTE), (BYTE *)buf, NULL))
-				{
-					if (bVerbose) DebugPrint(0, L"Write to channel failed for some reason.");
-				}
-			if (!ReleaseMutex(ghMutex))
-			{
-				if (bVerbose) DebugPrint(0, L"Release failed");
-			}
+			if (bDebug) printf("[*] Connection closed or error for thread %08X, error: %d\n", dwThreadId, WSAGetLastError());
 			break;
+		}
 
-		case WAIT_ABANDONED:
-			return FALSE;
+		if (bDebug) printf("[*] Received %d bytes, forwarding to server\n", ret);
 
+		if (!WriteChannel(pChannel, dataBuffer, ret, dwThreadId, FALSE))
+		{
+			if (bDebug) printf("[-] Failed to write to channel\n");
+			break;
 		}
 	}
 
+	// Send close signal
+	WriteChannel(pChannel, "", 0, dwThreadId, TRUE);
+
+	closesocket(sock);
 	DeleteThread(dwThreadId);
+	free(dataBuffer);
+
+	if (bDebug) printf("[*] Connection handler terminated for thread %08X\n", dwThreadId);
+
 	return 0;
 }
 
-DWORD SocksOverRDPPlugin::ListenerThread(PVOID param)
+// Handle SOCKS protocol with proper handshake
+BOOL HandleSocksRequest(char* buffer, DWORD dwSize, IWTSVirtualChannel* pChannel, DWORD dwThreadId, struct threads* pta)
 {
-	WSADATA		wsaData;
-	ADDRINFOW	*result = NULL;
-	ADDRINFOW	hints;
-	SOCKET		s, c;
-	HANDLE		hDummyThread;
-	DWORD		dwDummyThreadId;
-	int			ret;
+	char response[300];
 
-	DebugPrint(0, L"[*] Setting up server socket");
-	if ((ret = WSAStartup(MAKEWORD(2, 2), &wsaData)) != 0)
+	// SOCKS5 greeting
+	if (!pta->handshakeDone && dwSize >= 3 && buffer[0] == 0x05)
 	{
-		DebugPrint(ret, L"WSAStartup() failed with error: %ld", ret);
-		return -1;
-	}
+		if (bDebug) printf("[*] SOCKS5 greeting received for thread %08X\n", dwThreadId);
 
-	ZeroMemory(&hints, sizeof(hints));
-	hints.ai_family = AF_INET;
-	hints.ai_socktype = SOCK_STREAM;
-	hints.ai_protocol = IPPROTO_TCP;
-	hints.ai_flags = AI_PASSIVE;
+		// Send "no authentication required" response
+		response[0] = 0x05; // SOCKS version
+		response[1] = 0x00; // No authentication
 
-	if ((ret = GetAddrInfoW(ta.running_args->ip, ta.running_args->port, &hints, &result)) != 0) {
-		DebugPrint(ret, L"[-] GetAddrInfoW() failed with error: %ld", ret);
-		return -1;
-	}
-
-	if ((s = socket(result->ai_family, result->ai_socktype, result->ai_protocol)) == INVALID_SOCKET) {
-		DebugPrint(WSAGetLastError(), L"[-] socket() failed with error: %ld", WSAGetLastError());
-		FreeAddrInfoW(result);
-		return -1;
-	}
-
-	if (setsockopt(s, SOL_SOCKET, SO_REUSEADDR, "1", 1) == SOCKET_ERROR)
-	{
-		DebugPrint(WSAGetLastError(), L"[-] setsockopt() failed with error: %ld", WSAGetLastError());
-	}
-
-	ta.sockserver = s;
-
-	if ((ret = bind(s, result->ai_addr, (int)result->ai_addrlen)) == SOCKET_ERROR) {
-		DebugPrint(WSAGetLastError(), L"[-] bind() failed with error: %ld", WSAGetLastError());
-		FreeAddrInfoW(result);
-		closesocket(s);
-		return -1;
-	}
-
-	FreeAddrInfoW(result);
-	DebugPrint(0, L"[*] Listening on: %s:%s", ta.running_args->ip, ta.running_args->port);
-
-	if ((ret = listen(s, SOMAXCONN)) == SOCKET_ERROR) {
-		DebugPrint(0, L"[-] listen() failed with error: %ld", WSAGetLastError());
-		closesocket(s);
-		return -1;
-	}
-
-	// while till the RDP connection wasn't closed and
-	// create a new thread for all new connections
-	while (ta.run)
-	{
-		if ((c = accept(s, NULL, NULL)) == INVALID_SOCKET) {
-			DebugPrint(0, L"[-] accept() failed with error: %ld", WSAGetLastError());
-			return -1;
+		if (!WriteChannel(pChannel, response, 2, dwThreadId, FALSE))
+		{
+			if (bDebug) printf("[-] Failed to send SOCKS5 greeting response\n");
+			return FALSE;
 		}
 
-		hDummyThread = CreateThread(
-			NULL,
-			0,
-			&SocksOverRDPPlugin::RelayToRDPChannel,
-			(void *)c,
-			0,
-			&dwDummyThreadId);
-		if (bVerbose) DebugPrint(0, L"[+] New thread created: %08X", dwDummyThreadId);
+		pta->handshakeDone = TRUE;
+		if (bDebug) printf("[+] SOCKS5 greeting response sent\n");
+		return TRUE;
 	}
-	
-	return 0;
+
+	// SOCKS5 connection request
+	if (pta->handshakeDone && !pta->connected && dwSize >= 10 && buffer[0] == 0x05 && buffer[1] == 0x01)
+	{
+		if (bDebug) printf("[*] SOCKS5 connection request received\n");
+
+		BYTE addrType = buffer[3];
+		char* addrPtr = buffer + 4;
+		WORD port;
+		struct sockaddr_in addr;
+		ADDRINFOA hints, * result = NULL;
+		int ret;
+
+		switch (addrType)
+		{
+		case 1: // IPv4
+		{
+			if (dwSize < 10)
+				return FALSE;
+
+			addr.sin_family = AF_INET;
+			memcpy(&addr.sin_addr, addrPtr, 4);
+			memcpy(&port, addrPtr + 4, 2);
+			addr.sin_port = port;
+
+			char ipStr[INET_ADDRSTRLEN] = { 0 };
+			inet_ntop(AF_INET, &addr.sin_addr, ipStr, sizeof(ipStr));
+			if (bDebug) printf("[*] Connecting to %s:%d\n", ipStr, ntohs(port));
+
+			pta->s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+			if (pta->s == INVALID_SOCKET)
+			{
+				if (bDebug) printf("[-] Failed to create socket\n");
+				response[0] = 5; response[1] = 1; response[2] = 0; response[3] = 1; // General failure
+				memset(response + 4, 0, 6);
+				WriteChannel(pChannel, response, 10, dwThreadId, FALSE);
+				return FALSE;
+			}
+
+			ret = connect(pta->s, (struct sockaddr*)&addr, sizeof(addr));
+			if (ret == SOCKET_ERROR)
+			{
+				if (bDebug) printf("[-] Failed to connect, error: %d\n", WSAGetLastError());
+				closesocket(pta->s);
+				pta->s = INVALID_SOCKET;
+				response[0] = 5; response[1] = 5; response[2] = 0; response[3] = 1; // Connection refused
+				memset(response + 4, 0, 6);
+				WriteChannel(pChannel, response, 10, dwThreadId, FALSE);
+				return FALSE;
+			}
+
+			// Send success response
+			response[0] = 5; response[1] = 0; response[2] = 0; response[3] = 1;
+			memcpy(response + 4, &addr.sin_addr, 4);
+			memcpy(response + 8, &addr.sin_port, 2);
+			WriteChannel(pChannel, response, 10, dwThreadId, FALSE);
+
+			if (bDebug) printf("[+] Connected successfully\n");
+			break;
+		}
+
+		case 3: // Domain name
+		{
+			BYTE domainLen = (BYTE)addrPtr[0];
+			if (dwSize < (DWORD)(7 + domainLen))
+				return FALSE;
+
+			char domain[256];
+			memcpy(domain, addrPtr + 1, domainLen);
+			domain[domainLen] = '\0';
+			memcpy(&port, addrPtr + 1 + domainLen, 2);
+
+			if (bDebug) printf("[*] Connecting to %s:%d\n", domain, ntohs(port));
+
+			ZeroMemory(&hints, sizeof(hints));
+			hints.ai_family = AF_INET;
+			hints.ai_socktype = SOCK_STREAM;
+
+			ret = GetAddrInfoA(domain, NULL, &hints, &result);
+			if (ret != 0)
+			{
+				if (bDebug) printf("[-] DNS resolution failed for %s\n", domain);
+				response[0] = 5; response[1] = 4; response[2] = 0; response[3] = 1; // Host unreachable
+				memset(response + 4, 0, 6);
+				WriteChannel(pChannel, response, 10, dwThreadId, FALSE);
+				return FALSE;
+			}
+
+			pta->s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+			if (pta->s == INVALID_SOCKET)
+			{
+				FreeAddrInfoA(result);
+				if (bDebug) printf("[-] Failed to create socket\n");
+				response[0] = 5; response[1] = 1; response[2] = 0; response[3] = 1; // General failure
+				memset(response + 4, 0, 6);
+				WriteChannel(pChannel, response, 10, dwThreadId, FALSE);
+				return FALSE;
+			}
+
+			memcpy(&addr, result->ai_addr, sizeof(addr));
+			addr.sin_port = port;
+			FreeAddrInfoA(result);
+
+			ret = connect(pta->s, (struct sockaddr*)&addr, sizeof(addr));
+			if (ret == SOCKET_ERROR)
+			{
+				if (bDebug) printf("[-] Failed to connect to %s, error: %d\n", domain, WSAGetLastError());
+				closesocket(pta->s);
+				pta->s = INVALID_SOCKET;
+				response[0] = 5; response[1] = 5; response[2] = 0; response[3] = 1; // Connection refused
+				memset(response + 4, 0, 6);
+				WriteChannel(pChannel, response, 10, dwThreadId, FALSE);
+				return FALSE;
+			}
+
+			// Send success response
+			response[0] = 5; response[1] = 0; response[2] = 0; response[3] = 1;
+			memcpy(response + 4, &addr.sin_addr, 4);
+			memcpy(response + 8, &addr.sin_port, 2);
+			WriteChannel(pChannel, response, 10, dwThreadId, FALSE);
+
+			if (bDebug) printf("[+] Connected successfully to %s\n", domain);
+			break;
+		}
+
+		default:
+			if (bDebug) printf("[-] Unsupported address type: %d\n", addrType);
+			response[0] = 5; response[1] = 8; response[2] = 0; response[3] = 1; // Address type not supported
+			memset(response + 4, 0, 6);
+			WriteChannel(pChannel, response, 10, dwThreadId, FALSE);
+			return FALSE;
+		}
+
+		pta->connected = TRUE;
+		if (bDebug) printf("[+] SOCKS5 connection established for thread %08X\n", dwThreadId);
+		return TRUE;
+	}
+
+	// SOCKS4 request
+	if (!pta->handshakeDone && dwSize >= 8 && buffer[0] == 0x04 && buffer[1] == 0x01)
+	{
+		if (bDebug) printf("[*] SOCKS4 connection request received\n");
+
+		struct sockaddr_in addr;
+		addr.sin_family = AF_INET;
+		memcpy(&addr.sin_port, buffer + 2, 2);
+		memcpy(&addr.sin_addr, buffer + 4, 4);
+
+		//if (bDebug) printf("[*] Connecting to %s:%d\n", inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
+
+		pta->s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+		if (pta->s == INVALID_SOCKET)
+		{
+			response[0] = 0; response[1] = 91; // Request rejected
+			memset(response + 2, 0, 6);
+			WriteChannel(pChannel, response, 8, dwThreadId, FALSE);
+			return FALSE;
+		}
+
+		int ret = connect(pta->s, (struct sockaddr*)&addr, sizeof(addr));
+		if (ret == SOCKET_ERROR)
+		{
+			if (bDebug) printf("[-] Failed to connect, error: %d\n", WSAGetLastError());
+			closesocket(pta->s);
+			pta->s = INVALID_SOCKET;
+			response[0] = 0; response[1] = 91; // Request rejected
+			memset(response + 2, 0, 6);
+			WriteChannel(pChannel, response, 8, dwThreadId, FALSE);
+			return FALSE;
+		}
+
+		// Send success response
+		memset(response, 0, 8);
+		response[1] = 90; // Request granted
+		WriteChannel(pChannel, response, 8, dwThreadId, FALSE);
+
+		pta->handshakeDone = TRUE;
+		pta->connected = TRUE;
+		if (bDebug) printf("[+] SOCKS4 connection established for thread %08X\n", dwThreadId);
+		return TRUE;
+	}
+
+	return FALSE;
 }
 
-// IWTSListenerCallback::OnNewChannelConnection implementation.
-HRESULT SocksOverRDPPlugin::OnNewChannelConnection(__in IWTSVirtualChannel *pChannel,
-	__in_opt BSTR data, __out BOOL *pbAccept, __out IWTSVirtualChannelCallback **ppCallback)
+// ATL COM Class implementation
+class ATL_NO_VTABLE SocksOverRDPPlugin :
+	public CComObjectRootEx<CComMultiThreadModel>,
+	public CComCoClass<SocksOverRDPPlugin, &CLSID_CompReg>,
+	public IWTSPlugin,
+	public IWTSVirtualChannelCallback,
+	public IWTSListenerCallback
 {
-	HRESULT		hr;
-	CComObject<SocksOverRDPPlugin> *pCallback;
-	CComPtr<SocksOverRDPPlugin> ptrCallback;
+public:
+	CComPtr<IWTSVirtualChannel> m_ptrChannel;
+	CComPtr<IWTSListener> m_ptrListener;
 
-	// Prevent C4100 "unreferenced parameter" warnings.
-	data;
+	DECLARE_REGISTRY_RESOURCEID(IDR_SocksOverRDPPLUGIN)
 
-	*pbAccept = FALSE;
+	BEGIN_COM_MAP(SocksOverRDPPlugin)
+		COM_INTERFACE_ENTRY(IWTSPlugin)
+		COM_INTERFACE_ENTRY(IWTSVirtualChannelCallback)
+		COM_INTERFACE_ENTRY(IWTSListenerCallback)
+	END_COM_MAP()
 
-	hr = CComObject<SocksOverRDPPlugin>::CreateInstance(&pCallback);
-	CHECK_QUIT_HR("SocksOverRDPPlugin::CreateInstance");
-	ptrCallback = pCallback;
+	DECLARE_PROTECT_FINAL_CONSTRUCT()
 
-	ptrCallback->SetChannel(pChannel, &ta);
+	HRESULT FinalConstruct()
+	{
+		return S_OK;
+	}
 
-	ta.running_args = &running_args;
-	ta.m_ptrChannel = pChannel;
-	ta.run = TRUE;
+	void FinalRelease()
+	{
+	}
+
+	// IWTSPlugin methods
+	HRESULT STDMETHODCALLTYPE Initialize(IWTSVirtualChannelManager* pChannelMgr);
+	HRESULT STDMETHODCALLTYPE Connected();
+	HRESULT STDMETHODCALLTYPE Disconnected(DWORD dwDisconnectCode) { return S_OK; }
+	HRESULT STDMETHODCALLTYPE Terminated() { return S_OK; }
+
+	// IWTSListenerCallback methods
+	HRESULT STDMETHODCALLTYPE OnNewChannelConnection(
+		IWTSVirtualChannel* pChannel,
+		BSTR data,
+		BOOL* pbAccept,
+		IWTSVirtualChannelCallback** ppCallback);
+
+	// IWTSVirtualChannelCallback methods
+	HRESULT STDMETHODCALLTYPE OnDataReceived(ULONG cbSize, BYTE* pBuffer);
+	HRESULT STDMETHODCALLTYPE OnClose();
+};
+
+// Implementation of COM interface methods
+HRESULT STDMETHODCALLTYPE SocksOverRDPPlugin::Initialize(IWTSVirtualChannelManager* pChannelMgr)
+{
+	HRESULT hr;
 
 	ghMutex = CreateMutex(NULL, FALSE, NULL);
 	ghLLMutex = CreateMutex(NULL, FALSE, NULL);
 
-	running_args.enabled = 0;
-	running_args.port = L"1080";
-	running_args.ip = L"127.0.0.1";
-	
-	if (!GetRegistrySettings())
+	WSADATA wsaData;
+	if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
 	{
-		DebugPrint(-1, L"[-] Could not access the registry settings");
+		return E_FAIL;
 	}
 
-	DebugPrint(0, L"[+] Starting Listener thread");
+	hr = pChannelMgr->CreateListener("SocksChannel", 0, this, &m_ptrListener);
+	if (FAILED(hr))
+	{
+		WSACleanup();
+		return hr;
+	}
 
-	// Create main thread that will spawn other threads upon new connections
-	HANDLE hListenerThread = CreateThread(
-		NULL,
-		0,
-		&SocksOverRDPPlugin::ListenerThread,
-		NULL,
-		0,
-		NULL);
+	if (bDebug) printf("[*] Plugin initialized successfully\n");
+	return S_OK;
+}
 
-	ta.hThread = hListenerThread;
+HRESULT STDMETHODCALLTYPE SocksOverRDPPlugin::Connected()
+{
+	if (bDebug) printf("[*] Plugin connected\n");
+	return S_OK;
+}
 
-	*ppCallback = ptrCallback;
-	(*ppCallback)->AddRef();
-
+HRESULT STDMETHODCALLTYPE SocksOverRDPPlugin::OnNewChannelConnection(
+	IWTSVirtualChannel* pChannel,
+	BSTR data,
+	BOOL* pbAccept,
+	IWTSVirtualChannelCallback** ppCallback)
+{
 	*pbAccept = TRUE;
+	*ppCallback = this;
+	this->AddRef();
 
-	return hr;
-}
-
-VOID SocksOverRDPPlugin::SetChannel(IWTSVirtualChannel *pChannel, struct threadargs *pTa)
-{
 	m_ptrChannel = pChannel;
-	gpta	= pTa;
+	g_pChannel = pChannel;
+
+	if (bDebug) printf("[*] New channel connection established\n");
+
+	return S_OK;
 }
 
-// When data is received from the RDP server on the channel, this function is
-// getting called with the *data on stack
-HRESULT STDMETHODCALLTYPE SocksOverRDPPlugin::OnDataReceived(ULONG cbSize, __in_bcount(cbSize) BYTE *pBuffer)
+HRESULT STDMETHODCALLTYPE SocksOverRDPPlugin::OnDataReceived(ULONG cbSize, BYTE* pBuffer)
 {
-	DWORD			dwThreadId, ret, dwRecvdLen, cbFullSize;
-	BOOL			bClose = FALSE, ofused = FALSE;
-	char			*buf;
-	struct threads  *pta;
+	static char szOverflow[BUF_SIZE * 4];
+	static DWORD dwOverflow = 0;
+	BOOL ofused = FALSE;
+	char* buf = (char*)pBuffer;
+	ULONG cbFullSize = cbSize;
+	DWORD dwRemoteThreadId, dwRecvdLen;
+	struct threads* pta;
 
-	buf = (char*)pBuffer;
-	cbFullSize = cbSize;
+	if (bDebug) printf("[*] Received %d bytes from server\n", cbSize);
 
-	// if overflow was present from previous call, it was saved and should be 
-	// prepended with the new data
-	// ofused if set, signals that szOverflow has the data instead of pBuffer
+	// Handle overflow from previous call
 	if (dwOverflow)
 	{
-		if (bVerbose) DebugPrint(0, L"Overflow was present from previous call. Stored bytes: %ld. Received bytes: %ld", dwOverflow, cbSize);
-		memcpy_s(szOverflow + dwOverflow, BUF_SIZE*4, pBuffer, cbSize);
+		if (bDebug) printf("[*] Handling overflow: %ld + %ld bytes\n", dwOverflow, cbSize);
+		memcpy_s(szOverflow + dwOverflow, BUF_SIZE * 4 - dwOverflow, pBuffer, cbSize);
 		buf = szOverflow;
 		cbFullSize = cbSize + dwOverflow;
 		dwOverflow = 0;
 		ofused = TRUE;
 	}
+
+	// Process data packets
 	while (cbFullSize)
 	{
-		// parsing the header, getting threadId from server side, that matches 
-		// the local threadID; recvlen which has the appended data length ;
-		// bClose bit which shows weather the connection will be/was closed
-		// on the server side.
-		memcpy(&dwThreadId, buf, sizeof(DWORD));
-		memcpy(&dwRecvdLen, buf + sizeof(DWORD), sizeof(DWORD));
-		if (buf[sizeof(DWORD) + sizeof(DWORD)] == 0x01) bClose = TRUE;
-
-		// finding thread based on the header. If no thread found, that is a
-		// problem, since there is no thread that has the associated info for
-		// this received data
-		pta = LookupThread(dwThreadId);
-		if (pta == NULL)
-			return -1;
-
-		if (bVerbose) DebugPrint(0, L"%08X: Read: %ld content length: %ld", dwThreadId, cbFullSize, dwRecvdLen);
-
-		if (dwRecvdLen <= cbFullSize - (sizeof(DWORD) + sizeof(DWORD) + sizeof(BYTE)))
+		if (cbFullSize < 9)
 		{
-			if (bVerbose) DebugPrint(0, L"%08X: Last read, smaller or equal.", dwThreadId);
-			if (dwRecvdLen)
+			if (ofused)
 			{
-				if (pta->s)
-				{
-					// send recvl bytes from the received data to the 
-					// corresponding socket
-					if ((ret = send(pta->s, buf + sizeof(DWORD) + sizeof(DWORD) + sizeof(BYTE), dwRecvdLen, 0)) == SOCKET_ERROR)
-					{
-						// error happened, stopping thread gently and
-						// recalculating pointers to the next packet
-						StopThread(dwThreadId);
-						if (bVerbose) DebugPrint(0, L"%08X: send() failed with error %ld %ld", dwThreadId, ret, WSAGetLastError());
+				dwOverflow = cbFullSize;
+			}
+			else
+			{
+				memcpy_s(szOverflow, BUF_SIZE * 4, buf, cbFullSize);
+				dwOverflow = cbFullSize;
+			}
+			cbFullSize = 0;
+			break;
+		}
 
-						cbFullSize -= (dwRecvdLen + sizeof(DWORD) + sizeof(DWORD) + sizeof(BYTE));
-						buf += (dwRecvdLen + sizeof(DWORD) + sizeof(DWORD) + sizeof(BYTE));
+		// Parse header
+		memcpy(&dwRemoteThreadId, buf, sizeof(DWORD));
+		memcpy(&dwRecvdLen, buf + sizeof(DWORD), sizeof(DWORD));
+		BOOL bClose = (buf[8] == 0x01);
+
+		if (bDebug) printf("[*] Processing packet: thread=%08X, len=%ld, close=%d\n", dwRemoteThreadId, dwRecvdLen, bClose);
+
+		// Look up thread
+		pta = LookupThread(dwRemoteThreadId);
+
+		if (pta == NULL)
+		{
+			// New SOCKS connection request
+			if (dwRecvdLen > 0)
+			{
+				// Create new thread entry (without socket yet)
+				pta = AddThread(dwRemoteThreadId, INVALID_SOCKET, m_ptrChannel);
+				if (pta)
+				{
+					if (HandleSocksRequest(buf + 9, dwRecvdLen, m_ptrChannel, dwRemoteThreadId, pta))
+					{
+						// If connected, start handler thread
+						if (pta->connected && pta->s != INVALID_SOCKET)
+						{
+							HANDLE hThread = CreateThread(NULL, 0, &HandleConnection, pta, 0, NULL);
+							if (hThread)
+							{
+								pta->hThread = hThread;
+								CloseHandle(hThread);
+							}
+						}
 					}
 					else
 					{
-						// recalculating pointers to the next packet
-						cbFullSize -= (ret + sizeof(DWORD) + sizeof(DWORD) + sizeof(BYTE));
-						buf += (ret + sizeof(DWORD) + sizeof(DWORD) + sizeof(BYTE));
-						if (bVerbose) DebugPrint(0, L"%08X: Sent on socket: %ld. cbFullSize: %ld", dwThreadId, ret, cbFullSize);
+						// Failed to handle request, clean up
+						DeleteThread(dwRemoteThreadId);
 					}
-				}
-			}
-			// bClose bit was set on the server side. Closing down connection
-			if (bClose)
-			{
-				StopThread(dwThreadId);
-				if (pta->s)
-					shutdown(pta->s, SD_SEND);
-
-				// only RST was sent from server side
-				if (!dwRecvdLen)
-				{
-					cbFullSize -= sizeof(DWORD) + sizeof(DWORD) + sizeof(BYTE);
-					buf += sizeof(DWORD) + sizeof(DWORD) + sizeof(BYTE);
 				}
 			}
 		}
 		else
 		{
-			// data remained on the buffer, less than specified in the header
-			if (bVerbose) DebugPrint(0, L"!!! OVERFLOW HAPPENED %ld > %ld", dwRecvdLen, cbFullSize);
+			// Existing connection
+			if (bClose)
+			{
+				if (bDebug) printf("[*] Close signal received for thread %08X\n", dwRemoteThreadId);
+				DeleteThread(dwRemoteThreadId);
+			}
+			else if (dwRecvdLen > 0)
+			{
+				if (!pta->connected)
+				{
+					// Continue handshake
+					if (HandleSocksRequest(buf + 9, dwRecvdLen, m_ptrChannel, dwRemoteThreadId, pta))
+					{
+						// If now connected, start handler thread
+						if (pta->connected && pta->s != INVALID_SOCKET && pta->hThread == NULL)
+						{
+							HANDLE hThread = CreateThread(NULL, 0, &HandleConnection, pta, 0, NULL);
+							if (hThread)
+							{
+								pta->hThread = hThread;
+								CloseHandle(hThread);
+							}
+						}
+					}
+				}
+				else
+				{
+					// Forward data to target
+					int sent = send(pta->s, buf + 9, dwRecvdLen, 0);
+					if (sent == SOCKET_ERROR)
+					{
+						if (bDebug) printf("[-] Send failed for thread %08X, error: %d\n", dwRemoteThreadId, WSAGetLastError());
+						DeleteThread(dwRemoteThreadId);
+					}
+					else if (bDebug)
+					{
+						printf("[+] Forwarded %d bytes to target for thread %08X\n", sent, dwRemoteThreadId);
+					}
+				}
+			}
+		}
+
+		// Move to next packet
+		DWORD packetSize = dwRecvdLen + 9;
+		if (packetSize <= cbFullSize)
+		{
+			cbFullSize -= packetSize;
+			buf += packetSize;
+		}
+		else
+		{
+			// Handle overflow
 			if (ofused)
 			{
-				// ofused set, memmove needed
 				memmove_s(szOverflow, BUF_SIZE * 4, buf, cbFullSize);
 				dwOverflow = cbFullSize;
 			}
@@ -887,11 +780,20 @@ HRESULT STDMETHODCALLTYPE SocksOverRDPPlugin::OnDataReceived(ULONG cbSize, __in_
 				memcpy_s(szOverflow, BUF_SIZE * 4, buf, cbFullSize);
 				dwOverflow = cbFullSize;
 			}
-
-			// not enough data to send, need to get more, stopping loop
 			cbFullSize = 0;
 		}
 	}
 
 	return S_OK;
 }
+
+HRESULT STDMETHODCALLTYPE SocksOverRDPPlugin::OnClose()
+{
+	TerminateThreads();
+	m_ptrChannel = NULL;
+	WSACleanup();
+	if (bDebug) printf("[*] Plugin closed\n");
+	return S_OK;
+}
+
+OBJECT_ENTRY_AUTO(__uuidof(CompReg), SocksOverRDPPlugin)
